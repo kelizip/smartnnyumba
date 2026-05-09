@@ -1,8 +1,8 @@
+'use strict';
 
 // ── Bootstrap: create all tables if they don't exist ─────────
 async function createCoreTables(pool) {
   const tbls = [
-    // users
     `CREATE TABLE IF NOT EXISTS users (
       id INT AUTO_INCREMENT PRIMARY KEY,
       full_name VARCHAR(150) NOT NULL,
@@ -15,6 +15,7 @@ async function createCoreTables(pool) {
       is_active TINYINT(1) DEFAULT 1,
       is_suspended TINYINT(1) DEFAULT 0,
       suspend_reason VARCHAR(255) DEFAULT NULL,
+      suspension_reason VARCHAR(255) DEFAULT NULL,
       mfa_enabled TINYINT(1) DEFAULT 0,
       last_login DATETIME DEFAULT NULL,
       id_number VARCHAR(30) DEFAULT NULL,
@@ -617,6 +618,7 @@ async function createCoreTables(pool) {
       secret VARCHAR(100) DEFAULT NULL,
       events JSON DEFAULT NULL,
       is_active TINYINT(1) DEFAULT 1,
+      disabled_reason VARCHAR(255) DEFAULT NULL,
       created_by INT DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
@@ -633,9 +635,6 @@ async function createCoreTables(pool) {
 
   for (const sql of tbls) {
     await pool.query(sql).catch(e => {
-      // errno 1067 = ER_INVALID_DEFAULT — MySQL strict mode rejects DATETIME DEFAULT NULL
-      // even when CREATE TABLE IF NOT EXISTS is skipped because the table already exists.
-      // This is harmless — the existing table schema is correct.
       if (e.errno !== 1067 && global.logger) {
         global.logger.warn('createCoreTables: ' + e.message.slice(0, 80));
       }
@@ -670,34 +669,53 @@ async function createCoreTables(pool) {
   } catch(e) { if (global.logger) global.logger.warn('createCoreTables admin: ' + e.message); }
 }
 
-'use strict';
+// ── Performance indexes (MySQL 5.7 compatible) ────────────────
+async function ensureIndexes(pool) {
+  const indexes = [
+    ['idx_ten_status',  'tenancies',            'status'],
+    ['idx_ten_tenant',  'tenancies',            'tenant_id'],
+    ['idx_inv_status',  'invoices',             'status'],
+    ['idx_inv_tenancy', 'invoices',             'tenancy_id'],
+    ['idx_inv_due',     'invoices',             'due_date'],
+    ['idx_pay_tenancy', 'payments',             'tenancy_id'],
+    ['idx_notif_user',  'notifications',        'user_id,is_read'],
+    ['idx_mr_property', 'maintenance_requests', 'property_id'],
+    ['idx_vis_checkin', 'visitors',             'check_in'],
+    ['idx_unit_prop',   'units',                'property_id'],
+  ];
+  for (const [name, table, cols] of indexes) {
+    try {
+      const [rows] = await pool.query(
+        `SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?`,
+        [table, name]
+      );
+      if (rows.length === 0) {
+        await pool.query(`CREATE INDEX ${name} ON ${table}(${cols})`);
+      }
+    } catch(_) {}
+  }
+}
 
-/**
- * auto_migrate.js
- * Adds missing columns to the users table safely.
- * Compatible with MySQL 5.7+ and MySQL 8+.
- * Runs before the server starts accepting connections.
- */
+// ── users table column migrations ────────────────────────────
 async function runMigrations(pool) {
   await createCoreTables(pool);
-  const log = (msg) => { if (global.logger) global.logger.info(msg); else console.log(msg); };
+  const log  = (msg) => { if (global.logger) global.logger.info(msg); else console.log(msg); };
   const warn = (msg) => { if (global.logger) global.logger.warn(msg); else console.warn(msg); };
 
-  // Columns to add to users table: [name, definition]
   const columnsToAdd = [
-    ['id_number',         'VARCHAR(30) DEFAULT NULL'],
-    ['id_type',           "VARCHAR(20) DEFAULT 'national_id'"],
-    ['passport_number',   'VARCHAR(30) DEFAULT NULL'],
-    ['emergency_contact', 'VARCHAR(100) DEFAULT NULL'],
-    ['emergency_phone',   'VARCHAR(20) DEFAULT NULL'],
-    ['vehicle_plate',     'VARCHAR(20) DEFAULT NULL'],
-    ['mfa_enabled',       'TINYINT(1) DEFAULT 0'],
-    ['is_suspended',      'TINYINT(1) DEFAULT 0'],
-    ['suspend_reason',    'VARCHAR(255) DEFAULT NULL'],
-    ['profile_photo',     'VARCHAR(500) DEFAULT NULL'],
+    ['id_number',          'VARCHAR(30) DEFAULT NULL'],
+    ['id_type',            "VARCHAR(20) DEFAULT 'national_id'"],
+    ['passport_number',    'VARCHAR(30) DEFAULT NULL'],
+    ['emergency_contact',  'VARCHAR(100) DEFAULT NULL'],
+    ['emergency_phone',    'VARCHAR(20) DEFAULT NULL'],
+    ['vehicle_plate',      'VARCHAR(20) DEFAULT NULL'],
+    ['mfa_enabled',        'TINYINT(1) DEFAULT 0'],
+    ['is_suspended',       'TINYINT(1) DEFAULT 0'],
+    ['suspend_reason',     'VARCHAR(255) DEFAULT NULL'],
+    ['suspension_reason',  'VARCHAR(255) DEFAULT NULL'],
+    ['profile_photo',      'VARCHAR(500) DEFAULT NULL'],
   ];
 
-  // Check which columns already exist
   let existingCols = [];
   try {
     const [rows] = await pool.query(
@@ -709,7 +727,6 @@ async function runMigrations(pool) {
     return;
   }
 
-  // Add only the missing columns one at a time
   let added = 0;
   for (const [colName, colDef] of columnsToAdd) {
     if (existingCols.includes(colName.toLowerCase())) continue;
@@ -723,8 +740,6 @@ async function runMigrations(pool) {
 
   if (added > 0) {
     log('✅ Auto-migration: added ' + added + ' column(s) to users table');
-
-    // Backfill from tenants table
     try {
       await pool.query(
         `UPDATE users u JOIN tenants t ON t.user_id = u.id SET
@@ -742,35 +757,8 @@ async function runMigrations(pool) {
   }
 }
 
-// ── Performance indexes (safe to run multiple times) ──────────
-async function ensureIndexes(pool) {
-  const indexes = [
-    "CREATE INDEX IF NOT EXISTS idx_ten_status   ON tenancies(status)",
-    "CREATE INDEX IF NOT EXISTS idx_ten_tenant   ON tenancies(tenant_id)",
-    "CREATE INDEX IF NOT EXISTS idx_inv_status   ON invoices(status)",
-    "CREATE INDEX IF NOT EXISTS idx_inv_tenancy  ON invoices(tenancy_id)",
-    "CREATE INDEX IF NOT EXISTS idx_inv_due      ON invoices(due_date)",
-    "CREATE INDEX IF NOT EXISTS idx_pay_tenancy  ON payments(tenancy_id)",
-    "CREATE INDEX IF NOT EXISTS idx_notif_user   ON notifications(user_id,is_read)",
-    "CREATE INDEX IF NOT EXISTS idx_mr_property  ON maintenance_requests(property_id)",
-    "CREATE INDEX IF NOT EXISTS idx_vis_checkin  ON visitors(check_in)",
-    "CREATE INDEX IF NOT EXISTS idx_unit_prop    ON units(property_id)",
-  ];
-  for (const sql of indexes) {
-    await pool.query(sql).catch(() => {}); // safe if already exists
-  }
-}
-
-module.exports = {
-  runMigrations: async (pool) => {
-    await runMigrations(pool);
-    await ensureIndexes(pool);
-  }
-};
-
-// Add receipt_url to expenses table
+// ── Additional table migrations ───────────────────────────────
 async function migrateExpenses(pool) {
-  const log  = (m) => { if (global.logger) global.logger.info(m); else console.log(m); };
   const warn = (m) => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
     const [rows] = await pool.query(
@@ -779,13 +767,10 @@ async function migrateExpenses(pool) {
     const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
     if (!cols.includes('receipt_url')) {
       await pool.query("ALTER TABLE expenses ADD COLUMN receipt_url VARCHAR(500) DEFAULT NULL");
-      log('✅ Auto-migration: added receipt_url to expenses');
     }
   } catch (e) { warn('migrateExpenses: ' + e.message); }
 }
 
-
-// Migrate cron_logs — add error_message column if missing
 async function migrateCronLogs(pool) {
   const warn = (m) => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
@@ -793,26 +778,19 @@ async function migrateCronLogs(pool) {
       "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cron_logs'"
     );
     const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
-    if (!cols.includes('error_message')) {
-      await pool.query("ALTER TABLE cron_logs ADD COLUMN error_message TEXT DEFAULT NULL");
-    }
-    if (!cols.includes('rows_affected')) {
-      await pool.query("ALTER TABLE cron_logs ADD COLUMN rows_affected INT DEFAULT 0");
-    }
-    if (!cols.includes('note')) {
-      await pool.query("ALTER TABLE cron_logs ADD COLUMN note VARCHAR(500) DEFAULT NULL");
-    }
+    if (!cols.includes('error_message')) await pool.query("ALTER TABLE cron_logs ADD COLUMN error_message TEXT DEFAULT NULL");
+    if (!cols.includes('rows_affected')) await pool.query("ALTER TABLE cron_logs ADD COLUMN rows_affected INT DEFAULT 0");
+    if (!cols.includes('note'))          await pool.query("ALTER TABLE cron_logs ADD COLUMN note VARCHAR(500) DEFAULT NULL");
   } catch (e) { warn('migrateCronLogs: ' + e.message); }
 }
 
-// Migrate mpesa_transactions — ensure created_at exists
 async function migrateMpesa(pool) {
   const warn = (m) => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
     const [rows] = await pool.query(
       "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='mpesa_transactions'"
     );
-    if (!rows.length) return; // table doesn't exist yet
+    if (!rows.length) return;
     const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
     if (!cols.includes('created_at')) {
       await pool.query("ALTER TABLE mpesa_transactions ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
@@ -820,73 +798,42 @@ async function migrateMpesa(pool) {
   } catch (e) { warn('migrateMpesa: ' + e.message); }
 }
 
-
-// Migrate visitors table — add expected_date and registered_by if missing
 async function migrateVisitors(pool) {
   const warn = (m) => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
-    // Check if table exists first
     const [tbls] = await pool.query(
       "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='visitors'"
     );
-    if (!tbls.length) return; // table doesn't exist yet — will be created by full DB setup
+    if (!tbls.length) return;
     const [rows] = await pool.query(
       "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='visitors'"
     );
-    if (!rows.length) return; // table doesn't exist yet
+    if (!rows.length) return;
     const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
-    if (!cols.includes('expected_date')) {
-      await pool.query("ALTER TABLE visitors ADD COLUMN expected_date DATE DEFAULT NULL");
-    }
-    if (!cols.includes('registered_by')) {
-      await pool.query("ALTER TABLE visitors ADD COLUMN registered_by INT DEFAULT NULL");
-    }
+    if (!cols.includes('expected_date')) await pool.query("ALTER TABLE visitors ADD COLUMN expected_date DATE DEFAULT NULL");
+    if (!cols.includes('registered_by')) await pool.query("ALTER TABLE visitors ADD COLUMN registered_by INT DEFAULT NULL");
     if (!cols.includes('status')) {
-      try {
-        await pool.query("ALTER TABLE visitors ADD COLUMN status ENUM('checked_in','checked_out','pre_registered') DEFAULT 'checked_in'");
-      } catch (_) {}
+      await pool.query("ALTER TABLE visitors ADD COLUMN status ENUM('checked_in','checked_out','pre_registered') DEFAULT 'checked_in'").catch(()=>{});
     } else {
-      // Try to ensure pre_registered is in the ENUM (safe, non-fatal)
-      try {
-        await pool.query("ALTER TABLE visitors MODIFY COLUMN status ENUM('checked_in','checked_out','pre_registered') DEFAULT 'checked_in'");
-      } catch (_) {}
+      await pool.query("ALTER TABLE visitors MODIFY COLUMN status ENUM('checked_in','checked_out','pre_registered') DEFAULT 'checked_in'").catch(()=>{});
     }
   } catch (e) { warn('migrateVisitors: ' + e.message); }
 }
 
-const _origRun = module.exports.runMigrations;
-module.exports.runMigrations = async (pool) => {
-  await _origRun(pool);
-  await migrateExpenses(pool);
-  await migrateCronLogs(pool);
-  await migrateMpesa(pool);
-  await migrateVisitors(pool);
-};
-
-// Audit log table
-const _origRun2 = module.exports.runMigrations;
-module.exports.runMigrations = async (pool) => {
-  await _origRun2(pool);
+async function migrateWebhooks(pool) {
+  const warn = (m) => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS audit_log (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT,
-        user_name VARCHAR(100),
-        action VARCHAR(100) NOT NULL,
-        entity_type VARCHAR(50),
-        entity_id INT,
-        details TEXT,
-        ip_address VARCHAR(45),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_user (user_id),
-        INDEX idx_entity (entity_type, entity_id),
-        INDEX idx_created (created_at)
-      )`);
-  } catch (_) {}
-};
+    const [rows] = await pool.query(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='webhooks'"
+    );
+    if (!rows.length) return;
+    const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
+    if (!cols.includes('disabled_reason')) {
+      await pool.query("ALTER TABLE webhooks ADD COLUMN disabled_reason VARCHAR(255) DEFAULT NULL");
+    }
+  } catch (e) { warn('migrateWebhooks: ' + e.message); }
+}
 
-// Migrate tenancies — add new columns from enhanced controller
 async function migrateTenancies(pool) {
   const warn = m => { if (global.logger) global.logger.warn(m); else console.warn(m); };
   try {
@@ -896,11 +843,11 @@ async function migrateTenancies(pool) {
     if (!rows.length) return;
     const cols = rows.map(r => r.COLUMN_NAME.toLowerCase());
     const toAdd = [
-      ['payment_plan',       "VARCHAR(20) DEFAULT 'monthly'"],
-      ['grace_period_days',  'TINYINT DEFAULT NULL'],
-      ['penalty_rate',       'DECIMAL(5,2) DEFAULT NULL'],
-      ['move_in_checklist',  'JSON DEFAULT NULL'],
-      ['lease_document',     'VARCHAR(500) DEFAULT NULL'],
+      ['payment_plan',      "VARCHAR(20) DEFAULT 'monthly'"],
+      ['grace_period_days', 'TINYINT DEFAULT NULL'],
+      ['penalty_rate',      'DECIMAL(5,2) DEFAULT NULL'],
+      ['move_in_checklist', 'JSON DEFAULT NULL'],
+      ['lease_document',    'VARCHAR(500) DEFAULT NULL'],
     ];
     for (const [col, def] of toAdd) {
       if (!cols.includes(col)) {
@@ -910,19 +857,24 @@ async function migrateTenancies(pool) {
   } catch(e) { warn('migrateTenancies: ' + e.message); }
 }
 
-
-const _origRunT = module.exports.runMigrations;
-module.exports.runMigrations = async (pool) => {
-  await _origRunT(pool);
-  await migrateTenancies(pool);
-  // ── Run numbered SaaS migrations (006-009+) ─────────────────────────
-  // migrate_runner tracks applied migrations in _migrations table,
-  // so each file runs exactly once even across restarts.
-  try {
-    const runner = require('./migrate_runner');
-    await runner.runAll(pool);
-  } catch(e) {
-    const warn = global.logger?.warn?.bind(global.logger) || console.warn;
-    warn('SaaS migration runner error: ' + e.message);
+// ── Main export ───────────────────────────────────────────────
+module.exports = {
+  runMigrations: async (pool) => {
+    await runMigrations(pool);
+    await ensureIndexes(pool);
+    await migrateExpenses(pool);
+    await migrateCronLogs(pool);
+    await migrateMpesa(pool);
+    await migrateVisitors(pool);
+    await migrateWebhooks(pool);
+    await migrateTenancies(pool);
+    // Run numbered SaaS migrations (006-009+)
+    try {
+      const runner = require('./migrate_runner');
+      await runner.runAll(pool);
+    } catch(e) {
+      const warn = global.logger?.warn?.bind(global.logger) || console.warn;
+      warn('SaaS migration runner error: ' + e.message);
+    }
   }
 };
