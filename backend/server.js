@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const app  = require('./app');
+
 const cron = require('./scripts/cron');
 const pool = require('./config/db');
 

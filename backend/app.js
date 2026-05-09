@@ -43,6 +43,7 @@ const logger = winston.createLogger({
 global.logger = logger;
 
 const app = express();
+app.set('trust proxy', 1);
 
 // ── Request ID middleware ─────────────────────────────────────
 const { v4: uuidv4 } = require('uuid');

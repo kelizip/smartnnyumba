@@ -26,7 +26,7 @@ exports.getAll = async (req, res) => {
     if (req.user.role === 'caretaker' && req.user.property_id) {
       sql += ' AND pr.id=?'; params.push(req.user.property_id);
     }
-    sql += ' GROUP BY u.id ORDER BY u.full_name';
+    sql += ' GROUP BY u.id, u.full_name, u.email, u.phone, u.is_active, u.created_at, t.id, t.id_number, t.vehicle_plate ORDER BY u.full_name';
     const [rows] = await pool.query(sql, params);
     ok(res, { tenants: rows });
   } catch(e) { safeErr(res, e); }
