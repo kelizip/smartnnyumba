@@ -147,7 +147,7 @@ export default function Billing() {
                       <td className="px-4 py-3 text-[--text-secondary]">{inv.description}</td>
                       <td className="px-4 py-3 font-medium text-[--text-primary]">{fmt(inv.amount)}</td>
                       <td className="px-4 py-3">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${inv.status==='paid'?'bg-green-100 text-green-700':'inv.status==="failed"?bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${inv.status==='paid'?'bg-green-100 text-green-700':inv.status==='failed'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
                           {inv.status}
                         </span>
                       </td>
