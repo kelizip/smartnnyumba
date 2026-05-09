@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Uploads (user files — back up separately, not in git)
+uploads/
+
+# Dev-only scripts — not for production deployments
+scripts/dev/
+
+# OS
+.DS_Store
+Thumbs.db
